@@ -1,0 +1,586 @@
+@Override
+	protected void doPost(SlingHttpServletRequest request, SlingHttpServletResponse response) throws ServletException, IOException {
+        setResponseType(response);
+		if (StringUtils.equals(request.getRequestPathInfo().getSelectorString(), SELECTOR_MULTISHOP_COOKIE_SET)) {
+            LOG.debug("Multishop Agregator filter for request : {}", request.getRequestPathInfo().getResourcePath());
+            HttpSession session = request.getSession();
+            ContextualSitePropertiesConfig caConfig = CommonUtil.getContextAwareConfig(request.getResource());
+            ContextualMultishopPropertiesConfig multishopConfig = CommonUtil.getMultishopContextAwareConfig(request.getResource());
+            LOG.debug("Multishop Agregator filter");
+
+            session.removeAttribute(MultishopConstants.SET_COOKIES);
+            session.removeAttribute(MultishopConstants.DELETE_COOKIES);
+
+            //is Author
+            if(StringUtils.equalsIgnoreCase(environmentTypeProvider.getEnvironmentType(), (ComponentConstants.AUTHOR))) {
+                response.getWriter().write(new Gson().toJson(AgregatorResultVO.builder(AggreagatorStatus.PASS, 7000).agregator(Boolean.FALSE).build()));
+                return;
+            }
+
+            try (ResourceResolver resourceResolver = request.getResourceResolver()) {
+                PageManager pageManager = resourceResolver.adaptTo(PageManager.class);
+    
+                if (ObjectUtils.isNotEmpty(pageManager)) {
+                    Page currentPage = pageManager.getContainingPage(request.getResource());
+    
+                    if (ObjectUtils.isNotEmpty(currentPage)) {
+                        //is not Aggregator Page
+                        if(this.getPassAgregator(currentPage)) {
+                            response.getWriter().write(new Gson().toJson(AgregatorResultVO.builder(AggreagatorStatus.PASS, 7000).agregator(Boolean.FALSE).build()));
+                            return;
+                        }
+
+                        Gson gson = new Gson();
+                        String multishopCode = multishopConfig.multishopCode();
+                        Cookie accessTokenCookie = this.getDecodeCookie(request, ACCESS_TOKEN);
+                        Cookie refreshTokenCookie = this.getDecodeCookie(request, REFRESH_TOKEN);
+                        Cookie authTokenCookie = this.getDecodeCookie(request, MultishopCommonUtil.CookieName.AUTH_TOKEN(request));
+                        String multishopCookiePath = MultishopCommonUtil.getCookiePath(request, environmentTypeProvider, currentPage);
+
+                        if(multishopConfig.smbAt()) {
+                            try {
+                                String accessToken = this.getAccessToken(request, accessTokenCookie, refreshTokenCookie, caConfig.accessTokenExpiry(), multishopCode, true, caConfig.localeCode(), currentPage);
+
+                                Map<String, Object> payloadMap = MultishopCommonUtil.jwtDecode(accessToken);
+                                Map<String, Object> contextData = (Map<String, Object>) payloadMap.get("context");
+
+                                if (ObjectUtils.isEmpty(contextData)) {
+                                    throw new BadTokenException(MultishopConstants.BAD_TYPE.EMPTY_ACCESS);
+                                }
+
+                                Map<String, Object> userData = (Map<String, Object>) contextData.get("user");
+
+                                if (ObjectUtils.isEmpty(userData)) {
+                                    throw new BadTokenException(MultishopConstants.BAD_TYPE.EMPTY_ACCESS);
+                                }
+
+                                String vatNumber = (String) userData.get("vatId");
+
+                                if(StringUtils.isBlank(vatNumber)) {
+
+                                    if(StringUtils.isNotEmpty(MultishopCommonUtil.getMultishopCode(accessToken)) && !MultishopCommonUtil.isVerifiedMultishopToken(accessToken, multishopCode)) {
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 8101)
+                                                .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                                .build(), caConfig.localeCode(), currentPage)));
+                                        return;
+                                    }
+
+                                    response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.NOT_SMB_SIGNUP, 8105)
+                                        .targetUrl(multishopConfig.signupPagePath())
+                                        .build(), caConfig.localeCode(), currentPage)));
+                                    return;
+                                }
+
+                                LOG.debug("Is Verified Multishop Token: {}", MultishopCommonUtil.isVerifiedMultishopToken(accessToken, multishopCode));
+                                if(!MultishopCommonUtil.isVerifiedMultishopToken(accessToken, multishopCode)) {
+                                    throw new NotMultishopException();
+                                }
+
+                                // logged in
+                                if(MultishopCommonUtil.isMultishopPathInCookie(authTokenCookie, multishopCookiePath)
+                                        && MultishopCommonUtil.isValidCookie(refreshTokenCookie)
+                                        && MultishopCommonUtil.isValidCookie(authTokenCookie)
+                                        && !MultishopCommonUtil.isExpiredToken(authTokenCookie.getValue())) {
+                                    response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.SUCCESS, 8000)
+                                        .build(), caConfig.localeCode(), currentPage)));
+                                        return;
+                                }
+
+                                String authToken = this.getAuthToken(request, accessToken);
+
+                                // set a authToken in a cookie
+                                response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.SUCCESS, 8000)
+                                    .authToken(authToken)
+                                    .expiresMilliSec(caConfig.obsTokenExpiry())
+                                    .shopCustomerGroup(this.getShopCustomerGroup(request, authToken))
+                                    .vatNumber((String) userData.get("vatId"))
+                                    .emailAddr((String) userData.get("emailAddr"))
+                                    .build(), caConfig.localeCode(), currentPage)));
+                                    return;
+                            }
+                            catch (EmptyTokenException e) {
+                                switch (e.getEmptyType()) {
+                                    case AUTH:
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 8204)
+                                            .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        break;
+                                    case AUTH_RESPONSE:
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 8206)
+                                            .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        break;
+                                    case AUTH_SSO:
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 8205)
+                                            .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        break;
+                                    case REFRESH:
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 8260)
+                                            .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        break;
+                                }
+                            }
+                            catch (BadTokenException e) {
+                                switch (e.getBadType()) {
+                                    case EMPTY_ACCESS:
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 8207)
+                                            .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        break;
+                                    case EMPTY_AUTH:
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 8201)
+                                            .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        break;
+                                    case ERROR_RESPONSE:
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 8202)
+                                            .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        break;
+                                }
+                            }
+                            catch (ExpiredTokenException e) {
+                                response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 8203)
+                                    .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                    .build(), caConfig.localeCode(), currentPage)));
+                            }
+                            catch (NotMultishopException e) {
+                                response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 8100)
+                                    .targetUrl(this.getTargetUrl(request, multishopConfig.verifyMemberGroupUrl()))
+                                    .build(), caConfig.localeCode(), currentPage)));
+                            }
+                            catch (MalformedURLException | UnsupportedEncodingException | JsonProcessingException | RuntimeException e) {
+                                LOG.error("Multishop agregator exception {}:", e);
+                                response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 9000)
+                                    .targetUrl(this.getTargetUrl(request, multishopConfig.agregatorErrorPageUrl()))
+                                    .build(), caConfig.localeCode(), currentPage)));
+                            }
+                        }
+                        else {
+                            try {
+                                String body = IOUtils.toString(request.getReader());
+                                String ENCODED_REFERER = MultishopCommonUtil.CookieName.ENCODED_REFERER(request);
+                                Cookie encodedReferer = this.getDecodeCookie(request, ENCODED_REFERER);
+                                String THIRD_PARTY_TOKEN = MultishopCommonUtil.CookieName.THIRD_PARTY_TOKEN(request);
+                                Cookie thirdPartyTokenCookie = this.getDecodeCookie(request, THIRD_PARTY_TOKEN);
+                                Boolean firstAgregator = Boolean.TRUE;
+                                String encryptReferer = null;
+                                String cert = StringUtils.EMPTY;
+                                String referer = StringUtils.EMPTY;
+                                String thirdPartyToken = StringUtils.EMPTY;
+
+                                if (StringUtils.isNotBlank(body)) {
+                                    JsonElement jsonElement = gson.fromJson(body, JsonElement.class);
+                                    JsonObject jsonObject = jsonElement.getAsJsonObject();
+
+                                    cert = ObjectUtils.isNotEmpty(jsonObject.get(AGGREGATOR_CERT)) && ObjectUtils.isNotEmpty(jsonObject.get(AGGREGATOR_CERT).getAsString()) ? jsonObject.get(AGGREGATOR_CERT).getAsString().replaceAll(" ", "+") : StringUtils.EMPTY;
+                                    referer = ObjectUtils.isNotEmpty(jsonObject.get(AGGREGATOR_REFERRER)) && ObjectUtils.isNotEmpty(jsonObject.get(AGGREGATOR_REFERRER).getAsString()) ? jsonObject.get(AGGREGATOR_REFERRER).getAsString() : StringUtils.EMPTY;
+                                    thirdPartyToken = ObjectUtils.isNotEmpty(jsonObject.get("signedtoken")) && ObjectUtils.isNotEmpty(jsonObject.get("signedtoken").getAsString()) ? jsonObject.get("signedtoken").getAsString().replaceAll(" ", "+") : StringUtils.EMPTY;
+                                }
+
+                                //Delete non-Aggregator data
+                                if(StringUtils.isNotEmpty(cert)) {
+                                    thirdPartyToken = null;
+                                    thirdPartyTokenCookie = null;
+                                    refreshTokenCookie = null;
+                                }
+
+                                //Delete non-WhiteList data
+                                if(MultishopCommonUtil.isValidCookie(refreshTokenCookie)) {
+                                    if(MultishopCommonUtil.isValidCookie(thirdPartyTokenCookie)) {
+                                        thirdPartyTokenCookie = null;
+                                    }
+                                    if(MultishopCommonUtil.isValidCookie(encodedReferer)) {
+                                        encodedReferer = null;
+                                    }
+                                }
+
+                                /**
+                                 *
+                                 * Process of Page Access By 3rd party
+                                 *
+                                 * 1. thirdPartyAt
+                                 * 2. check SignUp required
+                                 * 3. thirdPartyToken exist
+                                 * 3-1. verification Thrid Party API
+                                 * 3-2. take third party guest token from OMS
+                                 *
+                                 */
+
+                                Boolean isThirdParty = multishopConfig.thirdPartyAt() && (StringUtils.isNotEmpty(thirdPartyToken) || MultishopCommonUtil.isValidCookie(thirdPartyTokenCookie));
+
+                                if(isThirdParty) {
+                                    //3rd party verification & sign up
+                                    if(multishopConfig.signUpRequiredAt()) {
+                                        //thirdPartyToken이 존재하는 경우 회원가입 페이지로 이동
+                                        if(StringUtils.isNotEmpty(thirdPartyToken)) {
+                                            //회원가입시 third party 정보가 필요하다면 세션에 추가.
+                                            response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 1490)
+                                                .targetUrl(multishopConfig.signupPagePath())
+                                                .build(), caConfig.localeCode(), currentPage)));
+                                            return;
+                                        }
+                                    }
+
+                                    Boolean isTokenEqualToThirdPartyCookie = Boolean.TRUE;
+                                    if (StringUtils.isNotEmpty(thirdPartyToken) && MultishopCommonUtil.isValidCookie(thirdPartyTokenCookie)) {
+                                        isTokenEqualToThirdPartyCookie = StringUtils.equalsIgnoreCase(thirdPartyToken, thirdPartyTokenCookie.getValue());
+                                    } else if(StringUtils.isNotEmpty(thirdPartyToken)) {
+                                        isTokenEqualToThirdPartyCookie = Boolean.FALSE;
+                                    }
+
+                                    boolean isThirdPartyLoggedIn = MultishopCommonUtil.isMultishopPathInCookie(authTokenCookie, multishopCookiePath)
+                                            && MultishopCommonUtil.isValidCookie(thirdPartyTokenCookie)
+                                            && isTokenEqualToThirdPartyCookie
+                                            && MultishopCommonUtil.isValidCookie(authTokenCookie)
+                                            && !MultishopCommonUtil.isExpiredToken(authTokenCookie.getValue());
+                                    // logged in
+                                    if (isThirdPartyLoggedIn) {
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.SUCCESS, 1000)
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        return;
+                                    }
+
+                                    //3rd party verification & no sign up
+                                    if(ObjectUtils.isNotEmpty(thirdPartyTokenCookie) && isTokenEqualToThirdPartyCookie) {
+                                        thirdPartyToken = thirdPartyTokenCookie.getValue();
+                                    }
+
+                                    LOG.debug("thirdPartyAt thirdPartyToken {}:", thirdPartyToken);
+                                    //3rd party verification Only, No sign up
+                                    String thirdPartyName = multishopConfig.thirdPartyName();
+                                    String thirdPartyVerificationResponse = thirdPartyVerificationService.getThirdPartyVerification(request, thirdPartyName, thirdPartyToken);
+                                    // if OMS third party API return empty data or error
+                                    if (StringUtils.isBlank(thirdPartyVerificationResponse)) {
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 1450)
+                                            .targetUrl(this.getTargetUrl(request, multishopConfig.agregatorErrorPageUrl()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        return;
+                                    }
+
+                                    Map<String, Object> thirdPartyMap = new Gson().fromJson(thirdPartyVerificationResponse, Map.class);
+                                    if(thirdPartyMap.containsKey("error")) {
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 1451)
+                                            .targetUrl(this.getTargetUrl(request, multishopConfig.agregatorErrorPageUrl()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        return;
+                                    }
+                                    if(!thirdPartyMap.containsKey("group_type")) {
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 1452)
+                                            .targetUrl(this.getTargetUrl(request, multishopConfig.agregatorErrorPageUrl()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        return;
+                                    }
+                                    // encrypt third login RSA256
+                                    String encryptThirdParty = this.createEncryptedreferer(this.getThirdPartyEncryptMap(thirdPartyName, (String) thirdPartyMap.get("group_type"), multishopConfig.multishopCode()), multishopConfig.omsRSAPublicKey());
+
+                                    // get third party AuthToken by OMS API
+                                    String thirdPartyLoginResponse = multishopThirdPartyLoginService.getThirdPartyLogin(request, encryptThirdParty);
+
+                                    // if OMS third party API return empty data or error
+                                    if (StringUtils.isBlank(thirdPartyLoginResponse)) {
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 1453)
+                                            .targetUrl(this.getTargetUrl(request, multishopConfig.agregatorErrorPageUrl()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        return;
+                                    }
+
+                                    ThirdPartyLoginVO thirdPartyLoginVO = gson.fromJson(thirdPartyLoginResponse, ThirdPartyLoginVO.class);
+
+                                    // if OMS third party API return Error
+                                    if (ObjectUtils.isEmpty(thirdPartyLoginVO.getData().getThirdPartyLoginInfo()) && (ObjectUtils.isNotEmpty(thirdPartyLoginVO.getError()) || ObjectUtils.isNotEmpty(thirdPartyLoginVO.getErrors()))) {
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 1400)
+                                            .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        return;
+                                    }
+
+                                    // if OMS third party API return Error
+                                    if (ObjectUtils.isEmpty(thirdPartyLoginVO.getData().getThirdPartyLoginInfo())) {
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 1410)
+                                            .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        return;
+                                    }
+
+                                    ObsThirdPartyLoginVO thirdPartyLoginInfo = thirdPartyLoginVO.getData().getThirdPartyLoginInfo();
+                                    Boolean status = thirdPartyLoginInfo.getStatus();
+                                    String token = thirdPartyLoginInfo.getToken();
+                                    String shopCode = thirdPartyLoginInfo.getShopCode();
+                                    String customerGroup = thirdPartyLoginInfo.getCustomerGroup();
+
+                                    boolean isValidThirdPartyData = status && StringUtils.isNotBlank(token) && StringUtils.equalsIgnoreCase(shopCode, multishopCode);
+                                    if (isValidThirdPartyData) {
+                                        deleteCookie(request, new String[] { ACCESS_TOKEN, REFRESH_TOKEN }, caConfig.localeCode(), currentPage);
+
+                                        // set a authToken in a cookie
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.SUCCESS, 1000)
+                                            .agregator(Boolean.TRUE)
+                                            .authToken(token)
+                                            .thirdPartyToken(thirdPartyToken)
+                                            .shopCustomerGroup(customerGroup)
+                                            .expiresMilliSec(caConfig.obsTokenExpiry())
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        return;
+                                    }
+
+                                    Integer statusCode = null;
+                                    if (StringUtils.isBlank(token)) {
+                                        statusCode = 1401;
+                                    } else if (!StringUtils.equalsIgnoreCase(shopCode, multishopCode)) {
+                                        statusCode = 1402;
+                                    } else if (!status) {
+                                        statusCode = 1403;
+                                    }
+
+                                    response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, statusCode)
+                                        .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                        .build(), caConfig.localeCode(), currentPage)));
+                                    return;
+                                }
+
+                                if(multishopConfig.agregatorAt()) {
+                                    if(StringUtils.isNotBlank(cert) & !referer.contains(cert)) {
+                                        encryptReferer = this.createEncryptedreferer(this.getEncryptMap(referer, cert, multishopCode), multishopConfig.omsRSAPublicKey());
+                                    }
+                                    else {
+                                        if(MultishopCommonUtil.isValidCookie(encodedReferer)) {
+                                            encryptReferer = encodedReferer.getValue();
+                                        }
+                                        firstAgregator = Boolean.FALSE;
+                                    }
+                                }
+
+                                LOG.debug("encript agregator domain map stirng: {}", encryptReferer);
+
+                                /**
+                                 *
+                                 * Process of Page Access By Aggregator
+                                 *
+                                 * 1. check cookie authToken exists and not expired
+                                 * 2. call OMS API
+                                 * 3. validate OMS API response
+                                 *
+                                 */
+                                boolean isApproachedByAggregator = multishopConfig.agregatorAt() && StringUtils.isNotBlank(encryptReferer);
+                                if(isApproachedByAggregator) {
+                                    LOG.debug("isApproachedByAggregator {}:", isApproachedByAggregator);
+
+                                    Boolean isEncryptRefererEqualToEncodedReferer = Boolean.TRUE;
+                                    if (StringUtils.isNotEmpty(encryptReferer) && MultishopCommonUtil.isValidCookie(encodedReferer)) {
+                                        LOG.debug("agregatorAt encryptReferer {}:", encryptReferer);
+                                        LOG.debug("agregatorAt encodedReferer {}:", encodedReferer.getValue());
+                                        isEncryptRefererEqualToEncodedReferer = StringUtils.equalsIgnoreCase(encryptReferer, encodedReferer.getValue());
+                                    } else if(StringUtils.isNotEmpty(encryptReferer)) {
+                                        isEncryptRefererEqualToEncodedReferer = Boolean.FALSE;
+                                    }
+
+                                    boolean isNotExpiredToken = MultishopCommonUtil.isMultishopPathInCookie(authTokenCookie, multishopCookiePath)
+                                            && MultishopCommonUtil.isValidCookie(encodedReferer)
+                                            && isEncryptRefererEqualToEncodedReferer
+                                            && MultishopCommonUtil.isValidCookie(authTokenCookie)
+                                            && !MultishopCommonUtil.isExpiredToken(authTokenCookie.getValue());
+                                    // logged in
+                                    if(isNotExpiredToken) {
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.SUCCESS, 1000)
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        return;
+                                    }
+
+                                    // get AuthToken by OMS API
+                                    String aggregatorTokenResponse = multishopAggregatorDomainCheckService.getAggregatorDomainCheck(request, encryptReferer);
+                                    LOG.debug("aggregatorTokenResponse {}:", aggregatorTokenResponse);
+                                    // if OMS API return empty data or error
+                                    if (StringUtils.isBlank(aggregatorTokenResponse)) {
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 1250)
+                                            .targetUrl(this.getTargetUrl(request, multishopConfig.agregatorErrorPageUrl()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        return;
+                                    }
+
+                                    AggregatorDomainCheckVO aggregatorDomainCheckVO = gson.fromJson(aggregatorTokenResponse, AggregatorDomainCheckVO.class);
+
+                                    // if OMS API return Error
+                                    if(ObjectUtils.isEmpty(aggregatorDomainCheckVO.getData().getAggregatorCheckInfo()) && (ObjectUtils.isNotEmpty(aggregatorDomainCheckVO.getError()) || ObjectUtils.isNotEmpty(aggregatorDomainCheckVO.getErrors()))) {
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 1200)
+                                            .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        return;
+                                    }
+
+                                    // if OMS API return Error
+                                    if(ObjectUtils.isEmpty(aggregatorDomainCheckVO.getData().getAggregatorCheckInfo())) {
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 1210)
+                                            .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        return;
+                                    }
+
+                                    LOG.debug("aggregatorDomainCheck Error Pass {}:", aggregatorDomainCheckVO);
+                                    ObsAggregatorCheckInfoVO aggregatorCheckInfo = aggregatorDomainCheckVO.getData().getAggregatorCheckInfo();
+                                    Boolean status = aggregatorCheckInfo.getStatus();
+                                    String token = aggregatorCheckInfo.getToken();
+                                    String shopCode = aggregatorCheckInfo.getShopCode();
+                                    String domain = aggregatorCheckInfo.getDomain();
+                                    String shopCustomerGroup = aggregatorCheckInfo.getShopCustomerGroup();
+                                    Boolean equalDomain = firstAgregator ? (StringUtils.isNotBlank(domain) && StringUtils.indexOfIgnoreCase(referer, domain) >= 0) : Boolean.TRUE;
+
+                                    boolean isValidOmsData = status && equalDomain && StringUtils.isNotBlank(token) && StringUtils.equalsIgnoreCase(shopCode, multishopCode);
+                                    if (isValidOmsData) {
+                                        deleteCookie(request, new String[] { ACCESS_TOKEN, REFRESH_TOKEN }, caConfig.localeCode(), currentPage);
+
+                                        // set a authToken in a cookie
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.SUCCESS, 1000)
+                                            .agregator(Boolean.TRUE)
+                                            .authToken(token)
+                                            .encodedReferer(encryptReferer)
+                                            .shopCustomerGroup(shopCustomerGroup)
+                                            .expiresMilliSec(caConfig.obsTokenExpiry())
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        return;
+                                    }
+
+                                    Integer statusCode = null;
+                                    if(!status) {
+                                        statusCode = 1201;
+                                    } else if(!equalDomain) {
+                                        statusCode = 1202;
+                                    } else if(StringUtils.isBlank(token)) {
+                                        statusCode = 1203;
+                                    } else if(!StringUtils.equalsIgnoreCase(shopCode, multishopCode)) {
+                                        statusCode = 1204;
+                                    }
+
+                                    response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, statusCode)
+                                        .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                        .build(), caConfig.localeCode(), currentPage)));
+                                    return;
+                                }
+
+                                if(multishopConfig.whitelistAt()) {
+                                    String accessToken = this.getAccessToken(request, accessTokenCookie, refreshTokenCookie, caConfig.accessTokenExpiry(), multishopCode, false, caConfig.localeCode(), currentPage);
+
+                                    // logged in
+                                    if(MultishopCommonUtil.isMultishopPathInCookie(authTokenCookie, multishopCookiePath)
+                                            && MultishopCommonUtil.isValidCookie(refreshTokenCookie)
+                                            && MultishopCommonUtil.isValidCookie(authTokenCookie)
+                                            && !MultishopCommonUtil.isExpiredToken(authTokenCookie.getValue())) {
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.SUCCESS, 5000)
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        return;
+                                    }
+
+                                    String authToken = this.getAuthToken(request, accessToken);
+
+                                    // set a authToken in a cookie
+                                    response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.SUCCESS, 5000)
+                                        .authToken(authToken)
+                                        .expiresMilliSec(caConfig.obsTokenExpiry())
+                                        .shopCustomerGroup(this.getShopCustomerGroup(request, authToken))
+                                        .build(), caConfig.localeCode(), currentPage)));
+                                    return;
+                                }
+                            }
+                            catch (EmptyTokenException e) {
+                                switch (e.getEmptyType()) {
+                                    case AUTH:
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 5204)
+                                            .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                            break;
+                                    case AUTH_RESPONSE:
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 5206)
+                                            .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                            break;
+                                    case AUTH_SSO:
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 5205)
+                                            .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                            break;
+                                    case REFRESH:
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 5260)
+                                            .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        break;
+                                }
+                            }
+                            catch (BadTokenException e) {
+                                switch (e.getBadType()) {
+                                    case EMPTY_ACCESS:
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 5207)
+                                            .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        break;
+                                    case EMPTY_AUTH:
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 5201)
+                                            .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        break;
+                                    case ERROR_RESPONSE:
+                                        response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 5202)
+                                            .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                            .build(), caConfig.localeCode(), currentPage)));
+                                        break;
+                                }
+                            }
+                            catch (ExpiredTokenException e) {
+                                response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 5203)
+                                    .targetUrl(this.getTargetUrl(request, caConfig.loginPagePath()))
+                                    .build(), caConfig.localeCode(), currentPage)));
+                            }
+                            catch (ExpiredAuthException e) {
+                                String reVerifyUrl = multishopConfig.reVerifyMemberGroupUrl();
+
+                                if(multishopConfig.smbAt()) {
+                                    reVerifyUrl = multishopConfig.smbReVerifyMemberGroupUrl();
+                                }
+
+                                response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.RE_VERIFY_MEMBER, 5101)
+                                    .targetUrl(this.getTargetUrl(request, reVerifyUrl))
+                                    .build(), caConfig.localeCode(), currentPage)));
+                            }
+                            catch (NotMultishopException e) {
+                                response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.VERIFY_MEMBER, 5100)
+                                    .targetUrl(this.getTargetUrl(request, multishopConfig.verifyMemberGroupUrl()))
+                                    .build(), caConfig.localeCode(), currentPage)));
+                            }
+                            catch (MalformedURLException | UnsupportedEncodingException | JsonProcessingException | NoSuchAlgorithmException | InvalidKeyException |
+                                NoSuchPaddingException | InvalidKeySpecException | IllegalBlockSizeException | BadPaddingException | RuntimeException e) {
+                                //            e.printStackTrace();
+                                LOG.error("Multishop agregator exception {}:", e);
+                                response.getWriter().write(new Gson().toJson(setResponseHeader(request, AgregatorResultVO.builder(AggreagatorStatus.ERROR, 9000)
+                                    .targetUrl(this.getTargetUrl(request, multishopConfig.agregatorErrorPageUrl()))
+                                    .build(), caConfig.localeCode(), currentPage)));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // HttpSession session = request.getSession();
+            // Map<String, Object> resultMap = new HashMap<>();
+
+            // if(ObjectUtils.isNotEmpty(session.getAttribute(MultishopConstants.SET_COOKIES))) {
+            //     resultMap.put("setCookies", session.getAttribute(MultishopConstants.SET_COOKIES));
+            // }
+
+            // if(ObjectUtils.isNotEmpty(session.getAttribute(MultishopConstants.DELETE_COOKIES))) {
+            //     resultMap.put("deleteCookies", session.getAttribute(MultishopConstants.DELETE_COOKIES));
+            // }
+
+            // String result = new Gson().toJson(resultMap);
+            // session.removeAttribute(MultishopConstants.SET_COOKIES);
+            // session.removeAttribute(MultishopConstants.DELETE_COOKIES);
+
+            // setResponseType(response);
+            // response.getWriter().write(result);
+		}
+		else {
+			LOG.error("The selector {} is not supported",request.getRequestPathInfo().getSelectorString());
+			JsonObject error = ResponseUtils.createErrorResponse(HttpStatus.SC_INTERNAL_SERVER_ERROR, MultishopConstants.ERROR, "The Selector "+request.getRequestPathInfo().getSelectorString()+" is not supported");
+			response.getWriter().write(error.toString());
+		}
+	}
